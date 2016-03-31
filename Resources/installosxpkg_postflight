@@ -1001,19 +1001,12 @@ def main():
             cleanupFromFailAndExit(
                 'Could not remove pre-existing %s: %s' % (dest_path, err))
     try:
-        print 'Attempting to link %s to %s...' % (install_dmg, dest_path)
-        os.link(install_dmg, dest_path)
+        print 'Attempting to copy %s to %s...' % (install_dmg, dest_path)
+        shutil.copy(install_dmg, dest_path)
     except OSError, err:
-        # couldn't link, so try to copy
-        print 'Couldn\'t create link because: %s' % err
-        try:
-            print ('Link not possible. Copying %s to %s...'
-                    % (install_dmg, dest_path))
-            shutil.copy(install_dmg, dest_path)
-        except OSError, err:
-            cleanupFromFailAndExit(
-                'Could not copy InstallESD.dmg to %s: %s' %
-                (install_data_path, err))
+        cleanupFromFailAndExit(
+            'Could not copy InstallESD.dmg to %s: %s' %
+            (install_data_path, err))
 
     if not target_volume_is_corestorage_or_raid:
         # create and write com.apple.Boot.plist file in install_data_path
