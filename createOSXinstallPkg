@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # encoding: utf-8
 #
-# Copyright 2012-2014 Greg Neagle.
+# Copyright 2012-2016 Greg Neagle.
 #
 # Licensed under the Apache License, Version 2.0 (the 'License');
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@ Created by Greg Neagle on 2012-07-16.
 Modified June 2013 for WWDC 2013
 Modified June 2014 for WWDC 2014
 Modified June 2015 for WWDC 2015
+Modified June 2016 for WWDC 2016
+Modified Aug 2016 for installs under SIP
 """
 
 import sys
@@ -35,6 +37,9 @@ import tempfile
 
 from xml.dom import minidom
 from xml.parsers.expat import ExpatError
+
+# we use lots of camelCase-style names. Deal with it.
+# pylint: disable=C0103
 
 DEBUG = False
 DEFAULT_INSTALLKBYTES = 8 * 1024 * 1024
@@ -56,7 +61,7 @@ def fail(errmsg=''):
 
 
 def cleanupOutput(output_path):
-    '''Attempt to clean up our output package/dmg
+    '''Attempt to clean up our output package/fake app
     if we fail during creation'''
     if not DEBUG:
         try:
@@ -104,7 +109,7 @@ def unmountdmg(mountpoint):
     proc = subprocess.Popen(['/usr/bin/hdiutil', 'detach', mountpoint],
                             bufsize=-1, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
-    (unused_output, err) = proc.communicate()
+    (dummy_output, err) = proc.communicate()
     if proc.returncode:
         print >> sys.stderr, 'Polite unmount failed: %s' % err
         print >> sys.stderr, 'Attempting to force unmount %s' % mountpoint
@@ -137,7 +142,8 @@ def makeDescriptionPlist(output_pkg_path, os_version='10.7', build_number=None):
               '10.8':  'OS X Mountain Lion',
               '10.9':  'OS X Mavericks',
               '10.10': 'OS X Yosemite',
-              '10.11': 'OS X El Capitan'}
+              '10.11': 'OS X El Capitan',
+              '10.12': 'macOS Sierra'}
     title = titles.get(major_version, major_version)
     description = ('Unattended custom install of %s version %s'
                    % (title, os_version))
@@ -298,7 +304,10 @@ def getItemsFromDist(filename):
         item_dict['title'] = title_elements[0].firstChild.wholeText
     script_elements = dom.getElementsByTagName('script')
     if len(script_elements):
-        item_dict['script'] = script_elements[0].toprettyxml()
+        for script_element in script_elements:
+            if script_element.toprettyxml() != '<script/>':
+                item_dict['script'] = script_element.toprettyxml()
+        #item_dict['script'] = script_elements[1:].toprettyxml()
     installation_check_elements = dom.getElementsByTagName('installation-check')
     if len(installation_check_elements):
         item_dict['installation_check'] = \
@@ -403,6 +412,20 @@ def copy_postflight_script(output_pkg_path):
     fail('Could not find postflight script.')
 
 
+def copy_brtool(brtool_path, output_pkg_path):
+    '''Copies brtool from the Install OS X.app into the package resources'''
+    destination = os.path.join(output_pkg_path, 'Contents/Resources/brtool')
+    try:
+        shutil.copy(brtool_path, destination)
+        # make sure it's executable
+        subprocess.check_call(
+            ['/bin/chmod', 'a+x', destination])
+        return True
+    except (OSError, subprocess.CalledProcessError), err:
+        cleanupOutput(output_pkg_path)
+        fail('Error copying brtool: %s' % err)
+
+
 def makePackage(output_pkg_path, expanded_osinstall_mpkg,
                 os_version, build_number, pkg_id=None):
     '''Makes our output package'''
@@ -421,11 +444,30 @@ def makePackage(output_pkg_path, expanded_osinstall_mpkg,
     source_pkg_resources = os.path.join(expanded_osinstall_mpkg, 'Resources')
     copyLocalizedResources(output_pkg_path, source_pkg_resources)
 
+
+def makeFakeApplicationBundle(fake_app_path, source_app_path):
+    '''Makes a fake app bundle VMware Fusion can use to install OS X'''
+    if os.path.exists(fake_app_path):
+        fail('Something already exists at %s' % fake_app_path)
+    try:
+        os.makedirs(os.path.join(fake_app_path, 'Contents/SharedSupport'))
+    except OSError, err:
+        fail('Error creating fake app directories at %s: %s'
+             % (fake_app_path, err))
+    source_info_plist = os.path.join(source_app_path, 'Contents/Info.plist')
+    destination = os.path.join(fake_app_path, 'Contents/Info.plist')
+    try:
+        shutil.copy(source_info_plist, destination)
+    except OSError, err:
+        cleanupOutput(fake_app_path)
+        fail('Error copying Info.plist: %s' % err)
+
+
 def get_dir_size(some_dir):
     '''Gets the total size of some_dir. Very helpful in determining
     the size of bundle packages.'''
     total_size = 0
-    for dirpath, unused_dirnames, filenames in os.walk(some_dir):
+    for dirpath, dummy_dirnames, filenames in os.walk(some_dir):
         for filename in filenames:
             filepath = os.path.join(dirpath, filename)
             total_size += os.path.getsize(filepath)
@@ -445,7 +487,7 @@ def get_size_of_all_packages(pkglist):
 
 def get_available_free_space_in_dmg(some_dmg):
     '''Returns free disk space on some_dmg in Kbytes'''
-    (mountpoints, unused_shadowpath) = mountdmg(some_dmg)
+    (mountpoints, dummy_shadowpath) = mountdmg(some_dmg)
     if mountpoints:
         stat = os.statvfs(mountpoints[0])
         free = stat.f_bavail * stat.f_frsize
@@ -547,6 +589,12 @@ def getPkgAndMakeIndexSproduct(destpath, os_vers='10.7'):
         'index-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard'
         '.merged-1.sucatalog')
 
+    SIERRA_PKGNAME = 'OSX_10_12_IncompatibleAppList.pkg'
+    SIERRA_CATALOG_URL = (
+        'https://swscan.apple.com/content/catalogs/others/'
+        'index-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard'
+        '.merged-1.sucatalog')
+
     if os_vers.startswith('10.7'):
         catalog_url = LION_CATALOG_URL
         package_name = LION_PKGNAME
@@ -567,6 +615,10 @@ def getPkgAndMakeIndexSproduct(destpath, os_vers='10.7'):
         catalog_url = EL_CAPITAN_CATALOG_URL
         package_name = EL_CAPITAN_PKGNAME
         os_vers = '10.11'
+    elif os_vers.startswith('10.12'):
+        catalog_url = SIERRA_CATALOG_URL
+        package_name = SIERRA_PKGNAME
+        os_vers = '10.12'
     else:
         print >> sys.stderr, 'Unsupported OS version!'
         return
@@ -738,7 +790,7 @@ def main():
     global TMPDIR
 
     usage = (
-        'Usage: %prog --source InstallOSX.app|InstallESD.dmg\n'
+        'Usage: %prog --source InstallOSX.app\n'
         '                           [--pkg path/to/additional.pkg]\n'
         '                           [--output path/to/InstallOSX.pkg]\n'
         '                           [--identifier com.example.installosx.pkg]\n'
@@ -753,7 +805,7 @@ def main():
     parser.add_option(
         '--source', '-s',
         help='Required unless specified via plist. Path to Install Mac '
-        'OS X Lion.app or Install OS X Foo.app or InstallESD.dmg')
+        'OS X Lion.app or Install OS X Foo.app ')
     parser.add_option(
         '--pkg', '-p', action="append", dest='packages',
         metavar='PACKAGE',
@@ -770,9 +822,10 @@ def main():
         'containing key/value pairs for Source, Output, Packages, and '
         'Identifier.')
     parser.add_option(
-        '--make-dmg', action='store_true', help='Optional. '
-        'Instead of creating an installer pkg, creates a disk image for use '
-        'with VMware Fusion to install a customized OS X. Experimental.')
+        '--make-fake-app', action='store_true', help='Optional. '
+        'Instead of creating an installer pkg, creates a fake installer '
+        'application for use with VMware Fusion to install a customized OS X. '
+        'Experimental.')
     options, arguments = parser.parse_args()
 
     if arguments:
@@ -794,7 +847,7 @@ def main():
         except (ExpatError, IOError), err:
             fail('Could not read %s: %s' % (options.plist, err))
 
-    if not options.source and not 'Source' in plist_options:
+    if not options.source and 'Source' not in plist_options:
         print >> sys.stderr, ('ERROR: Must have --source option!')
         parser.print_usage()
         exit(1)
@@ -807,24 +860,27 @@ def main():
             fail('%s doesn\'t exist or isn\'t an app!' % source)
         installesd_dmg = os.path.join(
             source, 'Contents/SharedSupport/InstallESD.dmg')
-        osinstall_mpkg = os.path.join(
-            source, 'Contents/SharedSupport/OSInstall.mpkg')
-        if (not os.path.exists(installesd_dmg) or
-                not os.path.exists(osinstall_mpkg)):
-            fail('%s doesn\'t appear to be an OS X installer application!'
-                 % source)
+        if not os.path.exists(installesd_dmg):
+            fail('Can\'t find InstallESD.dmg at %s' % installesd_dmg)
+        brtool_path = os.path.join(source, 'Contents/Resources/brtool')
+        if not os.path.exists(brtool_path):
+            fail('Can\'t find brtool at %s' % installesd_dmg)
 
     elif source.endswith('.dmg'):
-        installesd_dmg = source
-        if not os.path.exists(installesd_dmg):
-            fail('%s doesn\'t exist!' % installesd_dmg)
+        fail('This tool no longer supports using an InstallESD.dmg as a source.'
+             '/nProvide a path to an OS X/macOS install application instead.')
 
     else:
         fail('Unknown/unsupported source: %s' % source)
 
+    additional_packages = options.packages or plist_options.get('Packages', [])
+    if options.make_fake_app and not additional_packages:
+        fail('No additional packages specified -- nothing to add to the fake '
+             'install app!')
+
     # get some needed info from the disk image
     print 'Examining and verifying source...'
-    mountpoints, unused_shadowpath = mountdmg(installesd_dmg)
+    mountpoints, dummy_shadowpath = mountdmg(installesd_dmg)
     if not mountpoints:
         fail('Could not mount diskimage %s' % installesd_dmg)
     mountpoint = mountpoints[0]
@@ -835,7 +891,7 @@ def main():
         unmountdmg(mountpoint)
         fail('Missing BaseSystem.dmg in %s'% source)
 
-    basesystemmountpoints, unused_shadowpath = mountdmg(basesystem_dmg)
+    basesystemmountpoints, dummy_shadowpath = mountdmg(basesystem_dmg)
     basesystemmountpoint = basesystemmountpoints[0]
     system_version_plist = os.path.join(
         basesystemmountpoint,
@@ -883,15 +939,14 @@ def main():
 
     # Figure out where we will be writing this...
     custom_tag = ''
-    additional_packages = options.packages or plist_options.get('Packages')
 
     if additional_packages:
         custom_tag = '_custom'
         # get rid of trailing slashes which often result from dragging
         # and dropping from the Finder into the Terminal
         additional_packages = [item.rstrip('/') for item in additional_packages]
-    if options.make_dmg:
-        outputname_base = 'InstallOSX_%s_%s%s.dmg'
+    if options.make_fake_app:
+        outputname_base = 'FakeInstallOSX_%s_%s%s.app'
     else:
         outputname_base = 'InstallOSX_%s_%s%s.pkg'
     outputname = outputname_base % (os_version, build_number, custom_tag)
@@ -899,9 +954,9 @@ def main():
 
     output = options.output or plist_options.get('Output')
     if output:
-        if ((options.make_dmg and output.endswith('.dmg')) or
+        if ((options.make_fake_app and output.endswith('.app')) or
                 output.endswith('.pkg')):
-            # we've been given a full path including the pkg/dmg name
+            # we've been given a full path including the app/dmg name
             output_path = os.path.abspath(output)
         else:
             # it better be a pre-existing directory
@@ -927,7 +982,7 @@ def main():
             if not os.path.exists(pkg):
                 fail('Package %s not found!' % pkg)
             minor_version = int(os_version.split('.')[1])
-            if (minor_version >= 10 and not is_flat_distribution(pkg)):
+            if minor_version >= 10 and not is_flat_distribution(pkg):
                 fail('%s is not a flat distribution package. '
                      'This will cause a 10.10+ '
                      'install to fail.' % pkg)
@@ -951,7 +1006,7 @@ def main():
 
     pkg_id = (options.identifier or plist_options.get('Identifier'))
     # we have everything we need.
-    if not options.make_dmg:
+    if not options.make_fake_app:
         output_pkg_path = output_path
         print 'Creating package wrapper...'
         makePackage(output_pkg_path, expanded_osinstall_mpkg,
@@ -959,6 +1014,9 @@ def main():
 
         # if we have any failures after this point, we should be sure to
         # clean up the broken package as well as our TMPDIR
+
+        print 'Copying brtool into package resources...'
+        copy_brtool(brtool_path, output_pkg_path)
 
         print 'Creating MacOSXInstaller.choiceChanges...'
         makeEmptyInstallerChoiceChanges(output_pkg_path)
@@ -971,16 +1029,18 @@ def main():
 
         print '----------------------------------------------------------------'
         print 'Copying InstallESD into package...'
-        output_dmg_path = os.path.join(output_path,
-                                       'Contents/Resources/InstallESD.dmg')
+        output_dmg_path = os.path.join(
+            output_path, 'Contents/Resources/InstallESD.dmg')
     else:
         print '----------------------------------------------------------------'
-        print 'Creating custom InstallESD...'
-        output_dmg_path = output_path
+        print 'Creating custom fake Install.app...'
+        makeFakeApplicationBundle(output_path, source)
+        output_dmg_path = os.path.join(
+            output_path, 'Contents/SharedSupport/InstallESD.dmg')
 
-    if additional_packages or options.make_dmg:
+    if additional_packages or options.make_fake_app:
         create_minstallconfig = False
-        if options.make_dmg:
+        if options.make_fake_app:
             create_minstallconfig = True
         try:
             addPackagesToInstallESD(
@@ -997,13 +1057,12 @@ def main():
             fail('Copy error: %e' % err)
 
     print '----------------------------------------------------------------'
-    if not options.make_dmg:
+    if not options.make_fake_app:
         print 'Done! Completed package at: %s' % output_path
     else:
-        print 'Done! Completed disk image at: %s' % output_path
+        print 'Done! Completed fake app image at: %s' % output_path
     cleanUp()
 
 
 if __name__ == '__main__':
     main()
-
